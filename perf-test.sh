@@ -1,3 +1,5 @@
+// TODO write this as a test instead
+// https://gobyexample.com/testing-and-benchmarking
 #!/bin/bash
 
 for j in {1..10}

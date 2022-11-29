@@ -6,60 +6,126 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"github.com/pkg/errors"
+)
+
+const (
+	ItemTypeTextFile  = 0
+	ItemTypeDirectory = 1
+	// TODO: add more
 )
 
 func main() {
+	if err := do(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func do() error {
 	ex, err := os.Executable()
 	if err != nil {
-		panic(err)
+		return errors.Wrap(err, "getting executable")
 	}
 	exPath := filepath.Dir(ex)
 	fmt.Println(exPath)
 
 	hostFlagPtr := flag.String("host", "localhost", "host to serve from, defaults to localhost")
 	portFlagPtr := flag.Int("port", 1234, "port to run the gopher server on, defaults to 1234")
-	serveDirFlagPtr := flag.String("directory", exPath+"/sample", "path of directory to serve, defaults to sample folder in CWD")
+	serveDirFlagPtr := flag.String(
+		"directory",
+		exPath+"/sample",
+		"path of directory to serve, defaults to sample folder in CWD",
+	)
 
 	flag.Parse()
 
 	address := *hostFlagPtr + ":" + strconv.Itoa(*portFlagPtr)
 	serveDir := *serveDirFlagPtr
 
-	fmt.Println("listening on: ", address)
-	fmt.Println("serving dir: ", serveDir)
+	log.Println("listening on: ", address)
+	log.Println("serving dir: ", serveDir)
+
 	l, err := net.Listen("tcp", address)
-
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		return errors.Wrapf(err, "listening at %s", address)
 	}
-
 	defer l.Close()
+
+	// TODO
+	// setup sigterm/int/etc handler to stop accepting new conns and wait XXX time
+	// for active conns to close
+	// https://pkg.go.dev/os/signal#example_Notify
 
 	for {
 		c, err := l.Accept()
+		if err != nil {
+			return errors.Wrap(err, "accepting conn")
+		}
+		go handleConnection(c, serveDir, *portFlagPtr, *hostFlagPtr)
+	}
+}
+
+func handleConnection(c net.Conn, serveDir string, port int, host string) {
+	defer c.Close()
+
+	scanner := bufio.NewScanner(c)
+
+	scanner.Split(carriageReturnLineFeedSplitter)
+	scanner.Scan()
+	input := scanner.Bytes() // get bytes out after scanning
+
+	if len(input) == 0 {
+		entries, err := fs.ReadDir(os.DirFS(serveDir), ".")
+
+		if err != nil {
+			log.Println(err)
+			// TODO maybe pass an errs chan to conn handler for server to do something with?
+			// or maybe just write something back to the client conn here
+			return
+		}
+
+		gopherString := buildGopherBytesForDirectoryEntries(entries, "", port, host)
+		c.Write(gopherString) // respond to the client
+
+		return
+	}
+
+	// selector ends in "/", directory lookup
+	if len(input) > 0 && input[len(input)-1] == '/' {
+		// this is probably extremely unsafe and not correctly sand boxed
+		// 0:input.len - 1 because we don't want the trailing slash in the lookup
+		entries, err := fs.ReadDir(os.DirFS(serveDir), string(input[0:len(input)-1]))
 
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
 
-		go handleConnection(c, serveDir, *portFlagPtr, *hostFlagPtr)
+		gopherString := buildGopherBytesForDirectoryEntries(entries, string(input), port, host)
+		c.Write(gopherString) // respond to the client
+		return
 	}
 
+	// by this point, it must be a file - read directly
+	file, err := fs.ReadFile(os.DirFS(serveDir), string(input))
+
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	c.Write(file)
 }
 
-const (
-	ItemTypeTextFile  = 0
-	ItemTypeDirectory = 1
-	// todo: add more
-)
-
-func carriageReturnLineFeedSplitter(data []byte, atEof bool) (advance int, token []byte, err error) {
+func carriageReturnLineFeedSplitter(data []byte, atEof bool) (
+	advance int, token []byte, err error,
+) {
 	if atEof && len(data) == 0 {
 		return 0, nil, nil
 	}
@@ -85,7 +151,10 @@ func carriageReturnLineFeedSplitter(data []byte, atEof bool) (advance int, token
 	return 0, nil, nil
 }
 
-func buildGopherStringForDirectoryEntries(directoryEntries []fs.DirEntry, selectorBase string, port int, host string) string {
+func buildGopherBytesForDirectoryEntries(
+	directoryEntries []fs.DirEntry, selectorBase string, port int, host string,
+) []byte {
+	// TODO could do this whole shit as byte slice
 	gopherString := ""
 
 	for _, de := range directoryEntries {
@@ -117,55 +186,5 @@ func buildGopherStringForDirectoryEntries(directoryEntries []fs.DirEntry, select
 
 	gopherString += "." // append deliminating period
 
-	return gopherString
-}
-
-func handleConnection(c net.Conn, serveDir string, port int, host string) {
-	defer c.Close()
-
-	scanner := bufio.NewScanner(c)
-
-	scanner.Split(carriageReturnLineFeedSplitter)
-	scanner.Scan()
-	input := scanner.Bytes() // get bytes out after scanning
-
-	if len(input) == 0 {
-		entries, err := fs.ReadDir(os.DirFS(serveDir), ".")
-
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
-
-		gopherString := buildGopherStringForDirectoryEntries(entries, "", port, host)
-		c.Write([]byte(string(gopherString))) // respond to the client
-
-		return
-	}
-
-	// selector ends in "/", directory lookup
-	if len(input) > 0 && input[len(input)-1] == '/' {
-		// this is probably extremely unsafe and not correctly sand boxed
-		// 0:input.len - 1 because we don't want the trailing slash in the lookup
-		entries, err := fs.ReadDir(os.DirFS(serveDir), string(input[0:len(input)-1]))
-
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
-
-		gopherString := buildGopherStringForDirectoryEntries(entries, string(input), port, host)
-		c.Write([]byte(string(gopherString))) // respond to the client
-		return
-	}
-
-	// by this point, it must be a file - read directly
-	file, err := fs.ReadFile(os.DirFS(serveDir), string(input))
-
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	c.Write(file)
+	return []byte(gopherString)
 }
